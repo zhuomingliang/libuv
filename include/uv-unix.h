@@ -300,6 +300,7 @@ typedef struct {
   void* buf;                                                                  \
   size_t len;                                                                 \
   off_t off;                                                                  \
+  int whence;                                                                  \
   uv_uid_t uid;                                                               \
   uv_gid_t gid;                                                               \
   double atime;                                                               \
@@ -328,5 +329,15 @@ typedef struct {
 #define UV_FS_EVENT_PRIVATE_FIELDS                                            \
   uv_fs_event_cb cb;                                                          \
   UV_PLATFORM_FS_EVENT_FIELDS                                                 \
+
+#define uv_thread_yield pthread_yield
+#define uv_thread_exit(retval) pthread_exit(NULL)
+
+#define uv_fs_getstdin(loop, req, cb) uv_fs_getstd(loop, req,                 \
+        STDIN_FILENO, cb)
+#define uv_fs_getstdout(loop, req, cb) uv_fs_getstd(loop, req,                \
+        STDOUT_FILENO, cb)
+#define uv_fs_getstderr(loop, req, cb) uv_fs_getstd(loop, req,                \
+        STDERR_FILENO, cb)
 
 #endif /* UV_UNIX_H */

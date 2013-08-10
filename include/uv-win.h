@@ -546,12 +546,14 @@ RB_HEAD(uv_timer_tree_s, uv_timer_s);
   union {                                                                     \
     struct {                                                                  \
       int mode;                                                               \
+      const char* new_path;                                                   \
       WCHAR* new_pathw;                                                       \
       int file_flags;                                                         \
       int fd_out;                                                             \
       void* buf;                                                              \
       size_t length;                                                          \
       int64_t offset;                                                         \
+      int origin;                                                             \
     };                                                                        \
     struct {                                                                  \
       double atime;                                                           \
@@ -584,3 +586,13 @@ int uv_utf8_to_utf16(const char* utf8Buffer, WCHAR* utf16Buffer,
     size_t utf16Size);
 
 #define UV_PLATFORM_HAS_IP6_LINK_LOCAL_ADDRESS
+
+#define uv_thread_yield SwitchToThread
+#define uv_thread_exit(retval) ExitThread(0)
+
+#define uv_fs_getstdin(loop, req, cb) uv_fs_open(loop, req, NULL,            \
+        STD_INPUT_HANDLE, 0, cb)
+#define uv_fs_getstdout(loop, req, cb) uv_fs_open(loop, req, NULL,           \
+        STD_OUTPUT_HANDLE, 0, cb)
+#define uv_fs_getstderr(loop, req, cb) uv_fs_open(loop, req, NULL,           \
+        STD_ERROR_HANDLE, 0, cb)

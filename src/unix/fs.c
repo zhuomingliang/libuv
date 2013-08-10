@@ -191,6 +191,38 @@ static ssize_t uv__fs_read(uv_fs_t* req) {
     return pread(req->file, req->buf, req->len, req->off);
 }
 
+static int uv__fs_mkdir_p(char *pathname, mode_t mode) {
+  ssize_t r;
+  size_t len = strlen(pathname);
+
+  while ((len > 0) && (pathname[len - 1] == '/'))
+    len--;
+
+  pathname[len] = '\0';
+
+  r = mkdir(pathname, mode);
+
+  if (r == -1 && errno == ENOENT) {
+    size_t _len = len;
+
+    while ((_len > 0) && (pathname[_len - 1]) == '/')
+      _len--;
+
+    pathname[_len] = '\0';
+
+    r = uv__fs_mkdir_p(pathname, mode);
+
+    pathname[_len] = '/';
+
+    if(r == 0) {
+      r = mkdir(pathname, mode);
+    }
+  }
+
+  pathname[len] = '/';
+
+  return r;
+}
 
 static int uv__fs_readdir_filter(const struct dirent* dent) {
   return strcmp(dent->d_name, ".") != 0 && strcmp(dent->d_name, "..") != 0;
@@ -484,6 +516,9 @@ static ssize_t uv__fs_utime(uv_fs_t* req) {
   return utime(req->path, &buf); /* TODO use utimes() where available */
 }
 
+#if defined(__APPLE__)
+  static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
 
 static ssize_t uv__fs_write(uv_fs_t* req) {
   ssize_t r;
@@ -493,7 +528,6 @@ static ssize_t uv__fs_write(uv_fs_t* req) {
    * a dup().
    */
 #if defined(__APPLE__)
-  static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
   pthread_mutex_lock(&lock);
 #endif
 
@@ -507,6 +541,91 @@ static ssize_t uv__fs_write(uv_fs_t* req) {
 #endif
 
   return r;
+}
+
+static ssize_t uv__fs_flush(uv_fs_t* req) {
+  ssize_t r;
+  ssize_t written = 0;
+
+  const uv_file file = req->file;
+  char* const buf = req->buf;
+  const ssize_t len = req->len;
+
+  /* Serialize writes on OS X, concurrent write() and pwrite() calls result in
+   * data loss. We can't use a per-file descriptor lock, the descriptor may be
+   * a dup().
+   */
+#if defined(__APPLE__)
+  pthread_mutex_lock(&lock);
+#endif
+  do {
+    r = write(file, buf + written, len - written);
+
+    if (r)
+      written += r;
+  } while (written < len && (r > 0 || (r == -1 && errno == EINTR)));
+
+#if defined(__APPLE__)
+  pthread_mutex_unlock(&lock);
+#endif
+
+  return r;
+}
+
+static size_t uv__fs_lock(uv_fs_t* req) {
+  int flags = req->flags;
+  struct flock l;
+
+  ssize_t r;
+  int fc;
+
+  l.l_whence = SEEK_SET;
+  l.l_start = 0;
+  l.l_len = 0;
+
+  if ((flags & UV_FS_FLOCK_TYPEMASK) == UV_FS_FLOCK_SHARED)
+    l.l_type = F_RDLCK;
+  else
+    l.l_type = F_WRLCK;
+
+  fc = (flags & UV_FS_FLOCK_NONBLOCK) ? F_SETLK : F_SETLKW;
+
+  do {
+    r = fcntl(req->file, fc, &l);
+  } while (r == -1 && errno == EINTR);
+
+  return r;
+}
+
+static size_t uv__fs_unlock(uv_fs_t* req) {
+  struct flock l;
+  ssize_t r;
+
+  l.l_whence = SEEK_SET;
+  l.l_start = 0;
+  l.l_len = 0;
+  l.l_type = F_UNLCK;
+
+  do {
+    r = fcntl(req->file, F_SETLKW, &l);
+  } while (r == -1 && errno == EINTR);
+
+  return r;
+}
+
+static size_t uv__fs_getfullpath(uv_fs_t* req) {
+  char buf[PATH_MAX];
+
+  const char *path = req->path;
+
+  if (*path == '/') {
+    req->new_path = strdup(path);
+  } else {
+    uv_cwd(buf, PATH_MAX);
+    req->new_path = strdup(strcat(buf, req->path));
+  }
+
+  return 0;
 }
 
 static void uv__to_stat(struct stat* src, uv_stat_t* dst) {
@@ -625,6 +744,8 @@ static void uv__fs_work(struct uv__work* w) {
     X(LSTAT, uv__fs_lstat(req->path, &req->statbuf));
     X(LINK, link(req->path, req->new_path));
     X(MKDIR, mkdir(req->path, req->mode));
+    X(MKDIR_P, uv__fs_mkdir_p((char *)req->path, req->mode));
+    X(GETSTD, req->file);
     X(OPEN, open(req->path, req->flags, req->mode));
     X(READ, uv__fs_read(req));
     X(READDIR, uv__fs_readdir(req));
@@ -637,6 +758,11 @@ static void uv__fs_work(struct uv__work* w) {
     X(UNLINK, unlink(req->path));
     X(UTIME, uv__fs_utime(req));
     X(WRITE, uv__fs_write(req));
+    X(FLUSH, uv__fs_flush(req));
+    X(SEEK, lseek64(req->file, req->off, req->whence));
+    X(GETFULLPATH, uv__fs_getfullpath(req));
+    X(LOCK, uv__fs_lock(req));
+    X(UNLOCK, uv__fs_unlock(req));
     default: abort();
     }
 
@@ -808,6 +934,16 @@ int uv_fs_mkdir(uv_loop_t* loop,
   POST;
 }
 
+int uv_fs_mkdir_p(uv_loop_t* loop,
+                uv_fs_t* req,
+                const char* path,
+                int mode,
+                uv_fs_cb cb) {
+  INIT(MKDIR_P);
+  PATH;
+  req->mode = mode;
+  POST;
+}
 
 int uv_fs_open(uv_loop_t* loop,
                uv_fs_t* req,
@@ -822,6 +958,14 @@ int uv_fs_open(uv_loop_t* loop,
   POST;
 }
 
+int uv_fs_getstd(uv_loop_t* loop,
+                 uv_fs_t* req,
+                 uv_file file,
+                 uv_fs_cb cb) {
+  INIT(GETSTD);
+  req->file = file;
+  POST;
+}
 
 int uv_fs_read(uv_loop_t* loop, uv_fs_t* req,
                uv_file file,
@@ -950,9 +1094,62 @@ int uv_fs_write(uv_loop_t* loop,
   POST;
 }
 
+int uv_fs_flush(uv_loop_t* loop,
+                uv_fs_t* req,
+                uv_fs_cb cb) {
+  INIT(FLUSH);
+  POST;
+}
+
+int uv_fs_seek(uv_loop_t* loop,
+                uv_fs_t* req,
+                uv_file file,
+                int64_t off,
+                int whence,
+                uv_fs_cb cb) {
+  INIT(SEEK);
+  req->file = file;
+  req->off = off;
+  req->whence = whence;
+  POST;
+}
+
+int uv_fs_lock(uv_loop_t* loop,
+                uv_fs_t* req,
+                uv_file file,
+                int flags,
+                uv_fs_cb cb) {
+  INIT(LOCK);
+  req->file = file;
+  req->flags = flags;
+  POST;
+}
+
+int uv_fs_unlock(uv_loop_t* loop,
+                  uv_fs_t* req,
+                  uv_file file,
+                  uv_fs_cb cb) {
+  INIT(UNLOCK);
+  req->file = file;
+  POST;
+}
+
+int uv_fs_getfullpath(uv_loop_t* loop,
+                         uv_fs_t* req,
+                         const char* path,
+                         const char** new_path,
+                         uv_fs_cb cb) {
+  INIT(GETFULLPATH);
+  new_path = &(req->new_path);
+  PATH;
+  POST;
+}
 
 void uv_fs_req_cleanup(uv_fs_t* req) {
   free((void*) req->path);
+
+  if(req->new_path) free((void*) req->new_path);
+
   req->path = NULL;
   req->new_path = NULL;
 
